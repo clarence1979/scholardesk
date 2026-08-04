@@ -4876,16 +4876,19 @@ var HALF_PT = function(px){ return Math.round(px*1.5); };  /* px -> half-points 
 
 function docxRunProps(st){
   var p = '';
+  /* CT_RPrBase is an xsd:sequence - Word rejects any other child order:
+     rStyle, rFonts, b, i, strike, color, sz, szCs, u, shd, vertAlign */
+  if(st.font) p += '<w:rFonts w:ascii="'+xe(st.font)+'" w:hAnsi="'+xe(st.font)+'" w:cs="'+xe(st.font)+'"/>';
   if(st.b) p += '<w:b/>';
   if(st.i) p += '<w:i/>';
-  if(st.u) p += '<w:u w:val="single"/>';
   if(st.strike) p += '<w:strike/>';
-  if(st.sup) p += '<w:vertAlign w:val="superscript"/>';
-  if(st.sub) p += '<w:vertAlign w:val="subscript"/>';
-  if(st.font) p += '<w:rFonts w:ascii="'+xe(st.font)+'" w:hAnsi="'+xe(st.font)+'" w:cs="'+xe(st.font)+'"/>';
-  if(st.size) p += '<w:sz w:val="'+st.size+'"/><w:szCs w:val="'+st.size+'"/>';
   if(st.color) p += '<w:color w:val="'+st.color+'"/>';
+  if(st.size) p += '<w:sz w:val="'+st.size+'"/><w:szCs w:val="'+st.size+'"/>';
+  if(st.u) p += '<w:u w:val="single"/>';
   if(st.hl) p += '<w:shd w:val="clear" w:color="auto" w:fill="'+st.hl+'"/>';
+  /* at most one vertAlign is permitted */
+  if(st.sup) p += '<w:vertAlign w:val="superscript"/>';
+  else if(st.sub) p += '<w:vertAlign w:val="subscript"/>';
   return p ? '<w:rPr>'+p+'</w:rPr>' : '';
 }
 function docxRun(text, st){
@@ -4993,24 +4996,33 @@ function docxInline(node, st, ctx){
 var DOCX_STYLE_MAP = {h1:'Heading1', h2:'Heading2', h3:'Heading3', h4:'Heading4',
   blockquote:'Quote', pre:'Code'};
 function docxParaProps(el, extra){
-  var p = '', style = null, tag = el.tagName ? el.tagName.toLowerCase() : 'p';
+  var style = null, tag = el.tagName ? el.tagName.toLowerCase() : 'p';
   if(el.classList && el.classList.contains('doc-title')) style = 'Title';
   else if(el.classList && el.classList.contains('doc-sub')) style = 'Subtitle';
   else if(DOCX_STYLE_MAP[tag]) style = DOCX_STYLE_MAP[tag];
-  if(style) p += '<w:pStyle w:val="'+style+'"/>';
-  if(extra) p += extra;
+
+  /* CT_PPrBase is an xsd:sequence: pStyle, keepNext, numPr, pBdr, shd,
+     spacing, ind, jc, outlineLvl. Collect into slots, emit in order. */
+  var spacing = '', ind = '', jc = '';
+
   var align = null;
   try{ align = window.getComputedStyle(el).textAlign; }catch(e){}
   if(el.style && el.style.textAlign) align = el.style.textAlign;
-  if(align==='center') p += '<w:jc w:val="center"/>';
-  else if(align==='right') p += '<w:jc w:val="right"/>';
-  else if(align==='justify') p += '<w:jc w:val="both"/>';
-  if(el.classList && (el.classList.contains('bib-e')||el.classList.contains('hang')))
-    p += '<w:ind w:left="567" w:hanging="567"/><w:spacing w:line="480" w:lineRule="auto"/>';
+  if(align==='center') jc = '<w:jc w:val="center"/>';
+  else if(align==='right') jc = '<w:jc w:val="right"/>';
+  else if(align==='justify') jc = '<w:jc w:val="both"/>';
+
+  if(el.classList && (el.classList.contains('bib-e')||el.classList.contains('hang'))){
+    ind = '<w:ind w:left="567" w:hanging="567"/>';
+    spacing = '<w:spacing w:line="480" w:lineRule="auto"/>';
+  }
   if(el.style && el.style.lineHeight){
     var lh = parseFloat(el.style.lineHeight);
-    if(lh) p += '<w:spacing w:line="'+Math.round(lh*240)+'" w:lineRule="auto"/>';
+    /* replaces, never appends - two <w:spacing> in one <w:pPr> is invalid */
+    if(lh) spacing = '<w:spacing w:line="'+Math.round(lh*240)+'" w:lineRule="auto"/>';
   }
+
+  var p = (style ? '<w:pStyle w:val="'+style+'"/>' : '') + (extra||'') + spacing + ind + jc;
   return p ? '<w:pPr>'+p+'</w:pPr>' : '';
 }
 function docxPara(el, ctx, extraPr){
@@ -5108,10 +5120,11 @@ function buildDocx(html, meta){
    'Heading4|Heading 4|23|2C44A0|4'].map(function(x){
     var s = x.split('|');
     return '<w:style w:type="paragraph" w:styleId="'+s[0]+'"><w:name w:val="'+s[1]+'"/><w:basedOn w:val="Normal"/>'+
-      '<w:next w:val="Normal"/><w:pPr><w:keepNext/><w:outlineLvl w:val="'+(parseInt(s[4],10)-1)+'"/>'+
-      '<w:spacing w:before="240" w:after="80"/></w:pPr>'+
-      '<w:rPr><w:rFonts w:ascii="Calibri Light" w:hAnsi="Calibri Light"/><w:color w:val="'+s[3]+'"/>'+
-      '<w:sz w:val="'+s[2]+'"/><w:szCs w:val="'+s[2]+'"/>'+(s[4]>='3'?'<w:b/>':'')+'</w:rPr></w:style>';
+      '<w:next w:val="Normal"/><w:pPr><w:keepNext/>'+
+      '<w:spacing w:before="240" w:after="80"/><w:outlineLvl w:val="'+(parseInt(s[4],10)-1)+'"/></w:pPr>'+
+      '<w:rPr><w:rFonts w:ascii="Calibri Light" w:hAnsi="Calibri Light"/>'+(s[4]>='3'?'<w:b/>':'')+
+      '<w:color w:val="'+s[3]+'"/>'+
+      '<w:sz w:val="'+s[2]+'"/><w:szCs w:val="'+s[2]+'"/></w:rPr></w:style>';
   }).join('')+
   '<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/>'+
   '<w:pPr><w:pBdr><w:bottom w:val="single" w:sz="8" w:color="C9A84C"/></w:pBdr><w:spacing w:after="240"/></w:pPr>'+
@@ -5119,7 +5132,7 @@ function buildDocx(html, meta){
   '<w:style w:type="paragraph" w:styleId="Subtitle"><w:name w:val="Subtitle"/><w:basedOn w:val="Normal"/>'+
   '<w:rPr><w:color w:val="5A5A5A"/><w:sz w:val="26"/></w:rPr></w:style>'+
   '<w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/><w:basedOn w:val="Normal"/>'+
-  '<w:pPr><w:ind w:left="720"/><w:pBdr><w:left w:val="single" w:sz="12" w:color="C9A84C"/></w:pBdr></w:pPr>'+
+  '<w:pPr><w:pBdr><w:left w:val="single" w:sz="12" w:color="C9A84C"/></w:pBdr><w:ind w:left="720"/></w:pPr>'+
   '<w:rPr><w:i/><w:color w:val="444444"/></w:rPr></w:style>'+
   '<w:style w:type="paragraph" w:styleId="Code"><w:name w:val="HTML Preformatted"/><w:basedOn w:val="Normal"/>'+
   '<w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas"/><w:sz w:val="19"/></w:rPr></w:style>'+
