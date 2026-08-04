@@ -9583,6 +9583,347 @@ function pdfConvertToDoc(){
     toast('success','Converted '+PDFIO.name+'.pdf \u2014 it is now an editable document');
   }).catch(function(e){ toast('error','Conversion failed: '+e.message); });
 }
+/* ===========================================================================
+   PDF import — character-level style recovery.
+   getTextContent() gives geometry and text but no colour, weight or slope;
+   all of that lives in the operator list. We walk the operator list once,
+   build a character-indexed style table, then align it to the text items.
+   =========================================================================== */
+
+/* Private-use and symbol-font codepoints that Word/Office emit for list
+   bullets. They have no Unicode meaning, so they render as tofu boxes. */
+var PDF_BULLET_GLYPHS = {
+  '\uF0B7':'\u2022', '\uF0A7':'\u25AA', '\uF06C':'\u25CF', '\uF0D8':'\u27A4',
+  '\uF0FC':'\u2713', '\uF0A8':'\u25A1', '\uF0E0':'\u27A1', '\uF076':'\u2756',
+  '\uF0B0':'\u25CB', '\uF0A1':'\u25CF', '\uF02D':'\u2013', '\uF0B2':'\u25AA',
+  '\uF09F':'\u2022', '\uFFFD':'\u2022'
+};
+var PDF_BULLET_RE = /^[\u2022\u25CF\u25AA\u25A1\u25CB\u25E6\u2023\u2043\u00B7\u2219\u27A4\u27A1\u2756\u2713\u2010\u2011\u2012\u2013\u2014\u002D\u002A\u006F]\s+/;
+var PDF_NUM_RE = /^(\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\(?[ivxlIVXL]{1,6}[.)])\s+/;
+
+function pdfFixGlyphs(s){
+  if(!s) return s;
+  var out = '';
+  for(var i=0;i<s.length;i++){
+    var c = s.charAt(i);
+    out += (PDF_BULLET_GLYPHS[c] || (c >= '\uE000' && c <= '\uF8FF' ? '\u2022' : c));
+  }
+  return out;
+}
+
+function _pdfHex(r,g,b){
+  function h(v){ v = Math.max(0, Math.min(255, Math.round(v))); return ('0'+v.toString(16)).slice(-2); }
+  return (h(r)+h(g)+h(b)).toUpperCase();
+}
+/* pdf.js hands colour components back as 0-255 integers. */
+function _pdfRgbArgs(a){
+  var r = a[0], g = a[1], b = a[2];
+  if(r <= 1 && g <= 1 && b <= 1 && (r % 1 || g % 1 || b % 1)) { r*=255; g*=255; b*=255; }
+  return _pdfHex(r,g,b);
+}
+function _pdfFontFlags(name){
+  name = name || '';
+  return {
+    bold: /bold|black|heavy|semib|demib|ultra|[-_,]bd\b/i.test(name) ? 1 : 0,
+    italic: /italic|oblique|[-_,]it\b/i.test(name) ? 1 : 0
+  };
+}
+
+/* Walk the operator list; return {text, styles} as parallel per-character data. */
+function pdfStyleTableFromOps(page, op){
+  var OPS = pdfjsLib.OPS;
+  var st = { fill:'000000', bold:0, italic:0 };
+  var stack = [], text = [], styles = [], cur = null;
+  function snap(){ return { fill:st.fill, bold:st.bold, italic:st.italic }; }
+  /* `cur` is the frozen copy handed to glyphs; any state change invalidates it
+     so we never hand out a reference that later mutates underneath us. */
+  for(var i=0;i<op.fnArray.length;i++){
+    var fn = op.fnArray[i], args = op.argsArray[i];
+    if(fn === OPS.save) stack.push(snap());
+    else if(fn === OPS.restore){ var p = stack.pop(); if(p){ st = p; cur = null; } }
+    else if(fn === OPS.setFillRGBColor){ st.fill = _pdfRgbArgs(args); cur = null; }
+    else if(fn === OPS.setFillGray){ var v = args[0] <= 1 ? args[0]*255 : args[0]; st.fill = _pdfHex(v,v,v); cur = null; }
+    else if(fn === OPS.setFillCMYKColor){
+      var c=args[0], m=args[1], y=args[2], k=args[3];
+      if(c>1||m>1||y>1||k>1){ c/=255; m/=255; y/=255; k/=255; }
+      st.fill = _pdfHex(255*(1-Math.min(1,c+k)), 255*(1-Math.min(1,m+k)), 255*(1-Math.min(1,y+k))); cur = null;
+    }
+    else if(fn === OPS.setFont){
+      var nm = '';
+      try{ if(page.commonObjs.has(args[0])){ var fo = page.commonObjs.get(args[0]); nm = (fo && fo.name) || ''; } }catch(e){}
+      var f = _pdfFontFlags(nm); st.bold = f.bold; st.italic = f.italic; cur = null;
+    }
+    else if(fn === OPS.showText || fn === OPS.showSpacedText){
+      var glyphs = args[0];
+      if(!glyphs || !glyphs.length) continue;
+      for(var g=0; g<glyphs.length; g++){
+        var gl = glyphs[g];
+        if(!gl || typeof gl !== 'object' || gl.unicode == null) continue;
+        if(!cur) cur = snap();
+        /* a glyph's unicode may be several characters (ligatures, composed
+           accents) - push one style per character or the arrays desync */
+        var u = String(gl.unicode);
+        text.push(u);
+        for(var q=0;q<u.length;q++) styles.push(cur);
+      }
+    }
+  }
+  return { text: text.join(''), styles: styles };
+}
+
+/* Attach styles by walking both sequences in step. getTextContent() merges a
+   whole sentence into one item, so an item spanning a colour/weight change is
+   split into several, with x/width apportioned across the characters. */
+function pdfAttachStyles(items, tbl){
+  var text = tbl.text, styles = tbl.styles, p = 0, out = [];
+  var dflt = { fill:'000000', bold:0, italic:0 };
+  function styleAt(){ return (p < styles.length ? styles[p] : styles[styles.length-1]) || dflt; }
+  for(var i=0;i<items.length;i++){
+    var it = items[i], s = it.str || '', per = [];
+    for(var k=0;k<s.length;k++){
+      var ch = s.charAt(k);
+      if(/\s/.test(ch)){
+        if(p < text.length && /\s/.test(text.charAt(p))){ per.push(styles[p] || dflt); p++; }
+        else per.push(null);          /* synthesized space - inherit */
+        continue;
+      }
+      var guard = 0;
+      while(p < text.length && text.charAt(p) !== ch && guard++ < 12) p++;
+      if(p < text.length && text.charAt(p) === ch){ per.push(styles[p] || dflt); p++; }
+      else per.push(styleAt());
+    }
+    /* a synthesized space takes the style of its neighbours */
+    for(var k2=0;k2<per.length;k2++) if(!per[k2]) per[k2] = per[k2-1] || per[k2+1] || styleAt();
+    if(!per.length){ it.st = styleAt(); out.push(it); continue; }
+    var runs = [], cur = { st: per[0], a: 0 };
+    for(var k3=1;k3<per.length;k3++){
+      var a = per[k3], b = cur.st;
+      if(a.fill !== b.fill || a.bold !== b.bold || a.italic !== b.italic){
+        cur.b = k3; runs.push(cur); cur = { st:a, a:k3 };
+      }
+    }
+    cur.b = per.length; runs.push(cur);
+    if(runs.length === 1){ it.st = runs[0].st; out.push(it); continue; }
+    var W = it.w || 0, L = s.length;
+    for(var r=0;r<runs.length;r++){
+      var R = runs[r];
+      out.push({ x: it.x + W*(R.a/L), y: it.y, w: W*((R.b-R.a)/L),
+        str: s.slice(R.a, R.b), size: it.size, font: it.font, st: R.st });
+    }
+  }
+  return out;
+}
+
+/* Horizontal rules sitting just under a line's baseline are underlines. */
+function pdfUnderlineRanges(rules, l){
+  var out = [];
+  for(var i=0;i<rules.length;i++){
+    var r = rules[i];
+    if(r.t !== 'h') continue;
+    var drop = l.y - r.y;
+    if(drop < l.size*0.02 || drop > l.size*0.42) continue;
+    if(r.x1 <= l.x0 + 1 || r.x0 >= l.x1 - 1) continue;
+    out.push([r.x0, r.x1]);
+  }
+  return out;
+}
+
+/* Build styled runs for one line, merging neighbours that look identical. */
+function pdfLineSegs(l, unders){
+  var segs = [], last = null, prev = null;
+  for(var i=0;i<l.parts.length;i++){
+    var pt = l.parts[i], st = pt.st || { fill:'000000', bold:0, italic:0 };
+    var txt = pdfFixGlyphs(pt.str);
+    if(prev){
+      var gap = pt.x - (prev.x + prev.w);
+      if(gap > Math.max(1.2, prev.size*0.18) && !/\s$/.test(last ? last.text : '') && !/^\s/.test(txt)) txt = ' ' + txt;
+    }
+    prev = pt;
+    if(!txt) continue;
+    var mid = pt.x + (pt.w || 0)/2, u = 0;
+    if(txt.trim()) for(var k=0;k<unders.length;k++) if(mid >= unders[k][0]-2 && mid <= unders[k][1]+2){ u = 1; break; }
+    if(last && !txt.trim() && last.under===u){ last.text += txt; continue; }
+    if(last && last.bold===st.bold && last.italic===st.italic && last.color===st.fill && last.under===u){
+      last.text += txt;
+    } else {
+      last = { text:txt, bold:st.bold, italic:st.italic, color:st.fill, under:u };
+      segs.push(last);
+    }
+  }
+  return segs;
+}
+
+function pdfSegsHtml(segs, opts){
+  opts = opts || {};
+  var h = '';
+  for(var i=0;i<segs.length;i++){
+    var s = segs[i], raw = s.text;
+    if(!raw) continue;
+    /* keep padding outside the emphasis tags so copy/paste stays clean */
+    var lead = (raw.match(/^\s+/) || [''])[0];
+    var tail = raw.length > lead.length ? (raw.match(/\s+$/) || [''])[0] : '';
+    var core = raw.slice(lead.length, raw.length - tail.length);
+    if(!core){ h += esc(raw); continue; }
+    var t = esc(core);
+    if(s.color && s.color !== '000000') t = '<span style="color:#'+s.color+'">'+t+'</span>';
+    if(s.under) t = '<u>'+t+'</u>';
+    if(s.italic) t = '<i>'+t+'</i>';
+    if(s.bold && !opts.noBold) t = '<b>'+t+'</b>';
+    h += esc(lead) + t + esc(tail);
+  }
+  return h;
+}
+function pdfSegsText(segs){
+  var t = '';
+  for(var i=0;i<segs.length;i++) t += segs[i].text;
+  return t;
+}
+/* Remove a leading bullet/number marker from the first segment. */
+function pdfStripMarker(segs, n){
+  var left = n;
+  while(left > 0 && segs.length){
+    var s = segs[0];
+    if(s.text.length <= left){ left -= s.text.length; segs.shift(); }
+    else { s.text = s.text.slice(left); left = 0; }
+  }
+  while(segs.length && !segs[0].text) segs.shift();
+  return segs;
+}
+
+/* Group lines into blocks; a line that opens with a list marker always starts
+   a new block so bullets never get merged into the paragraph above. */
+function pdfBlocksFromLines(lines, rules){
+  var blocks = [], cur = null, prev = null;
+  for(var i=0;i<lines.length;i++){
+    var l = lines[i];
+    var segs = pdfLineSegs(l, pdfUnderlineRanges(rules, l));
+    var text = pdfSegsText(segs);
+    if(!text.trim()){ prev = l; continue; }
+    var lead = text.replace(/^\s+/, '');
+    var mk = null, mlen = 0, m;
+    if((m = lead.match(PDF_BULLET_RE))){ mk = 'ul'; mlen = (text.length - lead.length) + m[0].length; }
+    else if((m = lead.match(PDF_NUM_RE))){ mk = 'ol'; mlen = (text.length - lead.length) + m[0].length; }
+    var mval = null;
+    if(mk === 'ol') mval = _pdfMarkerValue(m[1]);
+    if(mk) segs = pdfStripMarker(segs, mlen);
+    var gap = prev ? (prev.y - l.y) : 1e9;
+    if(!cur || mk || cur.marker || gap > l.size*1.55 || Math.abs(l.size - cur.size) > 1.5){
+      cur = { size:l.size, lines:[], geo:[], x0:l.x0, x1:l.x1, yTop:l.y, marker:mk, mval:mval };
+      blocks.push(cur);
+    }
+    cur.lines.push(segs);
+    cur.geo.push({ x0:l.x0, x1:l.x1 });
+    cur.x0 = Math.min(cur.x0, l.x0); cur.x1 = Math.max(cur.x1, l.x1);
+    prev = l;
+  }
+  return blocks;
+}
+
+/* The dominant left edge of body text, and how far right text actually runs.
+   Alignment must be judged against this column, not against the page: at
+   Word's default 1in margins a page-relative test mistakes ordinary
+   left-aligned paragraphs for centred ones. */
+function pdfTextColumn(lines){
+  if(!lines || !lines.length) return { left:0, right:0 };
+  var buck = {}, best = null, bestN = -1, k;
+  for(var i=0;i<lines.length;i++){
+    k = Math.round(lines[i].x0 / 3);
+    (buck[k] = buck[k] || []).push(lines[i].x0);
+  }
+  for(k in buck) if(buck[k].length > bestN || (buck[k].length === bestN && +k < +best)){
+    bestN = buck[k].length; best = k;
+  }
+  var arr = buck[best], sum = 0;
+  for(var j=0;j<arr.length;j++) sum += arr[j];
+  var left = sum / arr.length;
+  var xs = lines.map(function(l){ return l.x1; }).sort(function(a,b){ return a-b; });
+  var right = xs[Math.min(xs.length-1, Math.floor(xs.length * 0.92))];
+  if(right < left + 20) right = xs[xs.length-1];
+  return { left:left, right:right };
+}
+
+/* Centred text has symmetric side margins; that separates it from an indented
+   block, which the old page-centre distance test could not do. */
+function pdfBlockAlign(b, col){
+  var tol = Math.max(4, (b.size || 11) * 0.6);
+  var geo = (b.geo && b.geo.length) ? b.geo : [{ x0:b.x0, x1:b.x1 }];
+  function leftAt(g){ return Math.abs(g.x0 - col.left) <= tol; }
+  function rightAt(g){ return Math.abs(g.x1 - col.right) <= tol; }
+  var allLeft = true, allRight = true, sym = true;
+  for(var i=0;i<geo.length;i++){
+    var g = geo[i], a = g.x0 - col.left, c = col.right - g.x1;
+    if(!leftAt(g)) allLeft = false;
+    if(!rightAt(g)) allRight = false;
+    if(!(a > tol && Math.abs(a - c) <= Math.max(tol, (a + c) * 0.18))) sym = false;
+  }
+  if(sym && !allLeft) return { align:'center', indent:0 };
+  if(allRight && !allLeft) return { align:'right', indent:0 };
+  if(geo.length > 1 && allLeft){
+    var full = true;
+    for(var j=0;j<geo.length-1;j++) if(!rightAt(geo[j])) full = false;
+    if(full) return { align:'justify', indent:0 };
+  }
+  var lg = b.x0 - col.left;
+  return { align:'', indent: lg > tol*2 ? lg : 0 };
+}
+
+function pdfBlockHtml(b, body, pw, col){
+  var segs = [];
+  for(var i=0;i<b.lines.length;i++){
+    if(i) segs.push({ text:' ', bold:0, italic:0, color:'000000', under:0 });
+    segs = segs.concat(b.lines[i]);
+  }
+  var plain = pdfSegsText(segs).replace(/\s+/g,' ').trim();
+  if(!plain) return '';
+  col = col || { left:pw*0.12, right:pw*0.88 };
+  var al = pdfBlockAlign(b, col), css = [];
+  if(al.align) css.push('text-align:' + al.align);
+  /* a list item already gets its indent from the surrounding <ul>/<ol> */
+  if(al.indent && !b.marker) css.push('margin-left:' + Math.round(al.indent * 4 / 3) + 'px');
+  var st = css.length ? ' style="' + css.join(';') + '"' : '';
+  var allBold = segs.length > 0 && segs.every(function(s){ return s.bold || !s.text.trim(); });
+  if(b.marker) return '<li'+st+'>' + pdfSegsHtml(segs) + '</li>';
+  /* Headings carry their weight in the tag, so don't double up with <b>. */
+  if(b.size >= body*1.65) return '<h1'+st+'>'+pdfSegsHtml(segs,{noBold:1})+'</h1>';
+  if(b.size >= body*1.32) return '<h2'+st+'>'+pdfSegsHtml(segs,{noBold:1})+'</h2>';
+  if(b.size >= body*1.14 && allBold) return '<h3'+st+'>'+pdfSegsHtml(segs,{noBold:1})+'</h3>';
+  return '<p'+st+'>'+pdfSegsHtml(segs)+'</p>';
+}
+
+/* Wrap runs of consecutive <li> blocks in the right list container. */
+function _pdfMarkerValue(tok){
+  var t = String(tok||'').replace(/[^0-9a-zA-Z]/g,'');
+  if(/^\d+$/.test(t)) return parseInt(t,10);
+  if(/^[ivxlIVXL]+$/.test(t)){
+    var R = {i:1,v:5,x:10,l:50}, s = t.toLowerCase(), n = 0;
+    for(var i=0;i<s.length;i++){ var v = R[s.charAt(i)], nx = R[s.charAt(i+1)]||0; n += (nx>v ? -v : v); }
+    return n || 1;
+  }
+  if(/^[a-zA-Z]$/.test(t)) return t.toLowerCase().charCodeAt(0) - 96;
+  return 1;
+}
+/* Wrap consecutive <li> blocks. Numbered runs carry their real start value so
+   a list split by an intervening block doesn't silently restart at 1. */
+function pdfWrapLists(flow){
+  var out = [], open = null, expect = 0;
+  for(var i=0;i<flow.length;i++){
+    var f = flow[i], mk = f.marker || null;
+    if(mk === 'ol'){
+      var v = (f.mval == null ? expect : f.mval);
+      if(open === 'ol' && v === expect){ out.push(f.html); expect = v + 1; continue; }
+      if(open){ out.push('</'+open+'>'); open = null; }
+      out.push(v === 1 ? '<ol>' : '<ol start="'+v+'">');
+      open = 'ol'; expect = v + 1; out.push(f.html); continue;
+    }
+    if(mk === 'ul' && open === 'ul'){ out.push(f.html); continue; }
+    if(open && mk !== open){ out.push('</'+open+'>'); open = null; }
+    if(mk){ out.push('<'+mk+'>'); open = mk; }
+    out.push(f.html);
+  }
+  if(open) out.push('</'+open+'>');
+  return out.join('');
+}
+
 function pdfPageToHtml(page){
   return Promise.all([page.getTextContent(), page.getOperatorList()]).then(function(res){
     var tc=res[0], op=res[1];
@@ -9597,29 +9938,22 @@ function pdfPageToHtml(page){
     var textChars=0;
     items.forEach(function(it){ textChars+=it.str.replace(/\s+/g,'').length; });
     if(textChars < 20) return pdfScannedPage(page);
+    /* colour/weight/slope live in the operator list, not the text content */
+    items = pdfAttachStyles(items, pdfStyleTableFromOps(page, op));
     return pdfImagesFromOps(page, op).then(function(imgs){
-      var tables=pdfDetectTables(pdfRulesFromOps(op), items);
+      var rules=pdfRulesFromOps(op);
+      var tables=pdfDetectTables(rules, items);
       var lines=pdfBuildLines(items.filter(function(it){ return !it.used; }));
       var sizes=items.map(function(it){ return it.size; }).sort(function(a,b){ return a-b; });
       var body=sizes.length ? sizes[Math.floor(sizes.length/2)] : 11;
       var pw=page.getViewport({scale:1}).width;
-      var blocks=[], cur=null, prev=null;
-      lines.forEach(function(l){
-        var text=pdfLineText(l);
-        if(!text.trim()){ prev=l; return; }
-        var gap=prev ? (prev.y-l.y) : 1e9;
-        if(!cur || gap > l.size*1.55 || Math.abs(l.size-cur.size) > 1.5){
-          cur={size:l.size, lines:[], x0:l.x0, x1:l.x1, bold:pdfLineBold(l), yTop:l.y};
-          blocks.push(cur);
-        }
-        cur.lines.push(text);
-        cur.x0=Math.min(cur.x0,l.x0); cur.x1=Math.max(cur.x1,l.x1);
-        prev=l;
-      });
-      var flow=blocks.map(function(b){ return {y:b.yTop, html:pdfBlockHtml(b,body,pw)}; })
+      var col=pdfTextColumn(lines);
+      var blocks=pdfBlocksFromLines(lines, rules);
+      var flow=blocks.map(function(b){
+          return {y:b.yTop, marker:b.marker, mval:b.mval, html:pdfBlockHtml(b,body,pw,col)}; })
         .concat(imgs).concat(tables);
       flow.sort(function(a,b){ return b.y-a.y; });
-      return flow.map(function(f){ return f.html; }).join('') || '<p><br></p>';
+      return pdfWrapLists(flow.filter(function(f){ return f.html; })) || '<p><br></p>';
     });
   });
 }
@@ -9653,15 +9987,7 @@ function pdfLineText(l){
 function pdfLineBold(l){
   return l.parts.length>0 && l.parts.every(function(p){ return /bold|black|heavy/i.test(p.font); });
 }
-function pdfBlockHtml(b, body, pw){
-  var text=b.lines.join(' ').replace(/\s+/g,' ').trim(), e2=esc(text);
-  var center=Math.abs(((b.x0+b.x1)/2)-pw/2) < pw*0.06 && (b.x1-b.x0) < pw*0.72 && b.x0 > pw*0.12;
-  var st=center ? ' style="text-align:center"' : '';
-  if(b.size >= body*1.65) return '<h1'+st+'>'+e2+'</h1>';
-  if(b.size >= body*1.32) return '<h2'+st+'>'+e2+'</h2>';
-  if(b.size >= body*1.14 && b.bold) return '<h3'+st+'>'+e2+'</h3>';
-  return '<p'+st+'>'+(b.bold?'<b>'+e2+'</b>':e2)+'</p>';
-}
+/* pdfBlockHtml is defined with the style-recovery helpers above. */
 function pdfImagesFromOps(page, op){
   return Promise.resolve(op).then(function(op){
     var OPS=pdfjsLib.OPS, out=[], ctm=[1,0,0,1,0,0], stack=[], jobs=[];
@@ -10026,7 +10352,8 @@ function pdfTableFromSpecs(rows, hdrFn){
     cells.forEach(function(cl){
       var content='';
       if(cl.parts.length){
-        content=pdfBuildLines(cl.parts).map(function(l){ return esc(pdfLineText(l).trim()); }).join('<br>');
+        content=pdfBuildLines(cl.parts).map(function(l){
+          return pdfSegsHtml(pdfLineSegs(l, [])).trim(); }).join('<br>');
       }
       var tag=hdrFn(r, cl) ? 'th' : 'td';
       html+='<'+tag+(cl.span>1?' colspan="'+cl.span+'"':'')+(cl.rspan>1?' rowspan="'+cl.rspan+'"':'')+'>'+(content||'<br>')+'</'+tag+'>';
