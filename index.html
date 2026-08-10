@@ -698,7 +698,8 @@ html.dark .wp-vruler{background-color:#1f2937}
 #sd-zoomrange{width:110px;accent-color:var(--brand-400);height:14px}
 .wp-status button.on{background:rgba(255,255,255,.22);border-radius:5px}
 #sd-ghost{position:fixed;z-index:9300;color:#8a97a8;font-size:15.5px;pointer-events:none;
-  background:rgba(255,255,255,.001);white-space:pre;font-family:inherit}
+  background:rgba(255,255,255,.001);white-space:pre;font-family:inherit;
+  overflow:hidden;text-overflow:ellipsis;max-width:60vw}
 html.dark #sd-ghost{color:#6b7a8c}
 .sd-a11y-flash{outline:3px solid var(--brand-500) !important;outline-offset:2px;border-radius:4px}
 html.sd-nomotion *{transition:none !important;animation:none !important}
@@ -8622,8 +8623,13 @@ function evTextMap(el){
   while((n = walker.nextNode())){
     var len = n.nodeValue.length;
     var pe = n.parentElement;
+    /* A field whose reference is not in the library renders as
+       "[missing source]". Counting it as a citation is how a pasted paragraph
+       ends up permanently exempt from the claim scanner. */
+    var cf = (pe && pe.closest) ? pe.closest('.cite-field, .ev-cite') : null;
     nodes.push({node:n, start:pos, end:pos+len,
-      cite: !!(pe && pe.closest && pe.closest('.cite-field, .ev-cite'))});
+      cite: !!(cf && !cf.classList.contains('missing')),
+      broken: !!(cf && cf.classList.contains('missing'))});
     pos += len;
   }
   return {nodes:nodes, text:el.textContent||'', len:pos};
@@ -8970,6 +8976,9 @@ function evEnsureBib(){
 /* Every path that inserts a citation ends here, so the reference list, the
    numbering and the claim list cannot drift apart. */
 function evAfterCite(){
+  /* The ghost was positioned against the text as it stood a moment ago; once
+     Evidence has inserted something it is measuring the wrong line. */
+  if(typeof PRED !== 'undefined' && PRED.hide) PRED.hide();
   var made = evEnsureBib();
   wpUpdateFields(true);
   wpTouch();
@@ -8977,6 +8986,69 @@ function evAfterCite(){
   renderWPChrome();
   if(made) toast('info','Reference list added at the end — it updates itself as you cite');
   return made;
+}
+
+/* ====================== citations pasted in from elsewhere ================ */
+/* Text pasted from another ScholarDesk document brings its citation fields with
+   it, but not the library entries they point at. Those render as
+   "[missing source]" and, until now, quietly suppressed any offer to source the
+   sentence they sat in. */
+function evBrokenFields(){
+  var e = ed(); if(!e) return [];
+  var out = [], f = e.querySelectorAll('.cite-field');
+  for(var i=0;i<f.length;i++){
+    var id = f[i].getAttribute('data-ref');
+    if(!id || !getRef(id)) out.push(f[i]);
+  }
+  return out;
+}
+
+function evCheckBroken(opts){
+  var broken = evBrokenFields();
+  if(!broken.length){
+    if(EV.broken){ EV.broken = null; evShowTray(); }
+    return 0;
+  }
+  EV.broken = {count: broken.length};
+  evShowTray();
+  return broken.length;
+}
+
+/* Strips the dead fields so the sentences become ordinary unsourced claims,
+   then puts them straight into the queue regardless of the toggle \u2014 the
+   writer asked for this by pressing the button. */
+function evFixBroken(removeOnly){
+  var broken = evBrokenFields();
+  if(!broken.length){ EV.broken = null; evShowTray(); return; }
+  var n = broken.length;
+  broken.forEach(function(sp){
+    var host = sp.parentNode;
+    if(host){ host.removeChild(sp); host.normalize(); evTidyText(host); }
+  });
+  EV.broken = null;
+  wpUpdateFields(true);
+  wpTouch();
+  var found = evDetectClaims(ed());
+  EV.claims = found;
+  EV.byId = {};
+  found.forEach(function(c){ EV.byId[c.id] = c; });
+  evMarkClaimBlocks();
+  if(!removeOnly){
+    found.forEach(function(c){
+      var k = evNorm(c.text);
+      delete EV.dismissed[k];
+      delete EV.checked[k];
+    });
+    evEnqueueAll(found);
+    if(!EV.queue.length && !evPref('autoCite'))
+      toast('info','Removed '+n+' dead citation'+(n!==1?'s':'')+'. Turn Auto-cite on, or use Find claims, to source them.');
+    else
+      toast('success','Removed '+n+' dead citation'+(n!==1?'s':'')+' \u2014 looking for replacements');
+  } else {
+    toast('success','Removed '+n+' dead citation'+(n!==1?'s':''));
+  }
+  renderWPChrome();
+  evShowTray();
 }
 
 /* ========================== auto-research a fact ========================== */
@@ -9224,6 +9296,7 @@ function evShowResearchLegacy(){
 }
 
 function evInsertResearch(useCorrection){
+  if(typeof PRED !== 'undefined' && PRED.hide) PRED.hide();
   var R = EV.research;
   if(!R){ return; }
   evHideBar();
@@ -10451,18 +10524,32 @@ function evSyncStatusToggles(){
   });
 }
 
+function evBrokenCardHTML(){
+  var B = EV.broken;
+  if(!B) return '';
+  return '<div class="ev-card warn">' +
+    '<span class="ais-ico">' + ic('alert',15,'t-red') + '</span>' +
+    '<span class="ais-txt"><strong>' + B.count + ' citation' + (B.count!==1?'s':'') +
+    ' point' + (B.count===1?'s':'') + ' to sources you do not have.</strong>' +
+    '<span class="ev-sug-src">Pasted text keeps its citation fields but not the library entries behind them.</span></span>' +
+    '<button class="btn btn-primary btn-xs" data-wp="ev-fix-broken">Find replacements</button>' +
+    '<button class="btn btn-secondary btn-xs" data-wp="ev-drop-broken">Just remove them</button>' +
+    '<button class="btn btn-ghost btn-xs" data-wp="ev-ignore-broken">Ignore</button></div>';
+}
+
 function evShowTray(){
   /* Drop cards whose sentence has since been deleted or rewritten. */
   EV.ready = EV.ready.filter(function(c){
     return !EV.dismissed[evNorm(c.text)] && evRelocate(c);
   });
   var R = EV.research;
-  if(!EV.ready.length && !R){ evHideBar(); return; }
+  if(!EV.ready.length && !R && !EV.broken){ evHideBar(); return; }
   var bar = document.getElementById('ev-bar');
   if(!bar){ bar = document.createElement('div'); bar.id = 'ev-bar'; document.body.appendChild(bar); }
   EV.sug = EV.ready[0] || null;
   var shown = EV.ready.slice(0, 3), hidden = EV.ready.length - shown.length;
-  var html = shown.map(evCardHTML).join('');
+  var html = evBrokenCardHTML();
+  html += shown.map(evCardHTML).join('');
   if(R) html += evResearchCardHTML();
   if(hidden > 0){
     html += '<div class="ev-card ev-more"><span class="ais-txt t-mute" style="font-size:11.5px">' +
@@ -10760,6 +10847,9 @@ function evCmd(cmd, arg){
       EV.ready.forEach(function(c){ EV.dismissed[evNorm(c.text)] = 'user'; });
       EV.ready = []; evShowTray(); return true;
     case 'ev-res-fix': evInsertResearch(true); return true;
+    case 'ev-fix-broken': evFixBroken(false); return true;
+    case 'ev-drop-broken': evFixBroken(true); return true;
+    case 'ev-ignore-broken': EV.broken = null; evShowTray(); return true;
     case 'ev-res-insert': evInsertResearch(); return true;
     case 'ev-res-no':
       if(EV.research) EV.dismissed['res:' + evNorm(EV.research.frag.text)] = true;
@@ -10804,6 +10894,7 @@ function evAfterOpen(){
   if(!evPref('autoAudit')) return;
   setTimeout(function(){
     var e = ed(); if(!e) return;
+    evCheckBroken();
     var col = evCollect(e);
     if(col.entries.length || col.intext.length){
       EV.tab = 'audit';
@@ -13955,8 +14046,18 @@ PRED.offer=function(txt, rect){
   PRED.hide();
   var g=document.createElement('span');
   g.id='sd-ghost'; g.textContent=txt+' \u21E5';
-  g.style.left=Math.min(innerWidth-160, rect.right+1)+'px';
-  g.style.top=(rect.top-2)+'px';
+  /* Clamp to the space actually left on the line, so a long suggestion is
+     truncated rather than running across the margin. */
+  var host = ed(), edge = innerWidth - 16;
+  if(host){
+    var hb = host.getBoundingClientRect();
+    edge = Math.min(edge, hb.right - 6);
+  }
+  var gl = rect.right + 1, avail = edge - gl;
+  if(avail < 110) return;               /* no room: say nothing */
+  g.style.left = gl + 'px';
+  g.style.top = (rect.top - 2) + 'px';
+  g.style.maxWidth = Math.floor(avail) + 'px';
   document.body.appendChild(g);
   PRED.ghost=g; PRED.text=txt;
 };
@@ -13971,6 +14072,19 @@ PRED.request=function(){
   if(!WP.predict || PRED.busy || WP.viewOnly) return;
   var e=ed(), sel=getSelection();
   if(!e || !sel.rangeCount || !sel.isCollapsed || !e.contains(sel.anchorNode)) return;
+  /* Only offer at the end of a block. Mid-paragraph the ghost is drawn from
+     the caret rightwards over text that is already there, which is what the
+     overlapping line in the report was. */
+  var gb = sel.anchorNode.nodeType===1 ? sel.anchorNode : sel.anchorNode.parentElement;
+  gb = gb && gb.closest ? gb.closest('p,li,blockquote,h1,h2,h3,h4,h5,h6,td,th') : null;
+  if(gb){
+    try{
+      var gr = document.createRange();
+      gr.setStart(sel.anchorNode, sel.anchorOffset);
+      gr.setEnd(gb, gb.childNodes.length);
+      if(gr.toString().trim()) return;
+    }catch(gx){}
+  }
   var rr=sel.getRangeAt(0).cloneRange(); rr.setStart(e, 0);
   var pre=rr.toString();
   if(pre.trim().length<12) return;
@@ -14923,6 +15037,11 @@ function wpMount(){
     if(ev.key==='Escape') PRED.hide();
   }, true);
   e.addEventListener('blur', function(){ setTimeout(function(){ PRED.hide(); }, 200); });
+  var gcv = document.getElementById('wp-canvas');
+  if(gcv && !gcv._ghostScroll){
+    gcv._ghostScroll = 1;
+    gcv.addEventListener('scroll', function(){ PRED.hide(); }, {passive:true});
+  }
   if(WP.lang) e.setAttribute('lang', WP.lang.indexOf('Australia')>=0?'en-AU':(WP.lang.indexOf('Kingdom')>=0?'en-GB':'en-US'));
   e.addEventListener('contextmenu', function(ev){
     var selc=getSelection(), collapsed=!selc.rangeCount || selc.isCollapsed;
@@ -14972,6 +15091,11 @@ function wpMount(){
       for(var i=0;i<bad.length;i++) bad[i].parentNode.removeChild(bad[i]);
       document.execCommand('insertHTML', false, clean.innerHTML);
       wpTouch();
+      /* execCommand does not reliably raise an input event across browsers,
+         so the scanners are told directly rather than left waiting. */
+      setTimeout(function(){
+        try{ wpUpdateFields(true); evCheckBroken(); evScan({quiet:true}); }catch(px){}
+      }, 60);
     }
   });
   document.addEventListener('selectionchange', wpSelWatch);
