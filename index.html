@@ -2928,6 +2928,8 @@ var AI = {
     if(!this.cfg.model) this.cfg.model = {};
     if(!this.cfg.discovered) this.cfg.discovered = {};
     if(!this.cfg.ollamaUrl) this.cfg.ollamaUrl = 'http://localhost:11434';
+    if(!this.cfg.webllmSource) this.cfg.webllmSource = 'auto';
+    if(this.cfg.webllmMirror == null) this.cfg.webllmMirror = '';
     var raw = jget(K.keys, {}), clean = {}, purged = [];
     for(var p in raw){ if(!raw[p] || !raw[p].key) continue;
       if(Date.now() - (raw[p].savedAt||0) > KEY_TTL_MS){ purged.push(PROVIDERS[p]?PROVIDERS[p].name:p); }
@@ -3062,17 +3064,67 @@ var AI = {
      and a download that trips over the network resumes rather than giving up:
      shards already fetched are kept in the browser cache, so each attempt
      picks up where the last one stopped. */
-  WEBLLM_ATTEMPTS: 5,
+  WEBLLM_ATTEMPTS: 4,
   WEBLLM_COOLDOWN_MS: 45000,
-  webllmState: {phase:'idle', text:'', progress:0, attempt:0, error:'', raw:''},
+  webllmState: {phase:'idle', text:'', progress:0, attempt:0, error:'', raw:'', source:''},
   _webllmInitP: null, _webllmInitModel: null, _webllmWatchers: [],
   _webllmFailedAt: 0, _webllmLastErr: null, _webllmFailures: 0,
+  _webllmSrc: '', _webllmTried: [], _webllmAttemptShards: 0, _webllmShardTotal: 0, _webllmBestShards: 0,
+
+  /* Where the model files come from.
+
+     Hugging Face hands the shards to a CDN (us.aws.cdn.hf.co) that some
+     networks refuse outright with ERR_HTTP2_PROTOCOL_ERROR: every shard, every
+     attempt, zero bytes. Retrying the same host cannot fix that, so the
+     download has more than one route: Hugging Face, the writer's own server if
+     one is configured, and the community mirror hf-mirror.com, which keeps the
+     same folder layout. A route that lands nothing twice running is treated
+     as blocked and the next one is tried. */
+  WEBLLM_SOURCES: {
+    hf:     {name:'Hugging Face',  base:'https://huggingface.co/mlc-ai/'},
+    custom: {name:'your server',   base:''},
+    mirror: {name:'hf-mirror.com', base:'https://hf-mirror.com/mlc-ai/'}
+  },
+  webllmSourceBase: function(src){
+    if(src === 'custom'){ var b = String(this.cfg.webllmMirror||'').trim(); return b ? (b.replace(/\/+$/,'')+'/') : ''; }
+    return (this.WEBLLM_SOURCES[src]||{}).base || '';
+  },
+  webllmSourceName: function(src){ return (this.WEBLLM_SOURCES[src]||{}).name || src; },
+  webllmSourceOrder: function(){
+    var pick = this.cfg.webllmSource || 'auto';
+    if(pick !== 'auto') return [pick];
+    var order = ['hf'];
+    if(this.webllmSourceBase('custom')) order.push('custom');
+    order.push('mirror');
+    /* The route that worked last time goes first: the cached shards live under its URLs. */
+    var lg = this.cfg.webllmLastGood;
+    if(lg && order.indexOf(lg) > 0){ order.splice(order.indexOf(lg), 1); order.unshift(lg); }
+    return order;
+  },
+  /* WebLLM's catalogue, re-pointed at another host. Entries are
+     https://huggingface.co/mlc-ai/<repo>; only the prefix changes, so the
+     repo names (including the -1k variants) stay right. */
+  _webllmAppConfig: function(lib, src){
+    var pre = lib.prebuiltAppConfig || {};
+    if(src === 'hf') return pre;
+    var base = this.webllmSourceBase(src);
+    if(!base) return null;
+    var cfg = {}; for(var k in pre) cfg[k] = pre[k];
+    cfg.model_list = (pre.model_list||[]).map(function(m){
+      var c = {}; for(var j in m) c[j] = m[j];
+      c.model = String(m.model||'').replace(/^https:\/\/huggingface\.co\/mlc-ai\//, base);
+      if(c.model === m.model) c.model = base + m.model_id;
+      return c;
+    });
+    return cfg;
+  },
 
   _webllmShort: function(m){ return String(m||'').replace(/-MLC$/,'').replace(/-q\df\d\d_\d.*$/,''); },
   /* WebLLM's own progress strings are a paragraph long; one line is enough. */
   _webllmPretty: function(raw, progress){
     var pct = Math.round((progress||0)*100), m = this._webllmShort(this._webllmInitModel || this.model('webllm'));
-    if(/fetching param/i.test(raw)) return 'Downloading '+m+' \u2014 '+pct+'% (first use only; it stays in this browser)';
+    var via = this._webllmSrc ? ' from '+this.webllmSourceName(this._webllmSrc) : '';
+    if(/fetching param|start to fetch/i.test(raw)) return 'Downloading '+m+via+' \u2014 '+pct+'% (first use only; it stays in this browser)';
     if(/loading model from cache|loading gpu shader|loading from cache/i.test(raw)) return 'Loading '+m+' into the GPU \u2014 '+pct+'%';
     if(/finish loading/i.test(raw)) return m+' is ready';
     return raw ? String(raw).slice(0,140) : ('Preparing '+m+'\u2026');
@@ -3080,24 +3132,38 @@ var AI = {
   _webllmNotify: function(text, progress, phase, raw){
     var st = this.webllmState;
     st.text = text; st.progress = progress; st.raw = raw || st.raw; if(phase) st.phase = phase;
+    st.source = this._webllmSrc || '';
     this._webllmWatchers.forEach(function(fn){ try{ fn(text, progress, st); }catch(e){} });
     if(typeof this.onWebLLMStatus === 'function'){ try{ this.onWebLLMStatus(st); }catch(e){} }
+  },
+  _webllmIsNetErr: function(err){
+    return /cannot fetch|failed to fetch|failed to store|request failed|networkerror|network error|load failed|err_|protocol|aborted|abort|timed? ?out|unexpected end|cache\.add|response was not ok|unable to fetch/i
+      .test(String(err && err.message || err || ''));
   },
   /* Network trouble is worth another go; a missing GPU or a model that does
      not fit is not. Checked in this order because the WASM file name itself
      contains "webgpu", so a failed fetch of it would otherwise read as fatal. */
   _webllmRetryable: function(err, n){
+    if(err && err.fatal) return false;
     var m = String(err && err.message || err || '');
-    if(/cannot fetch|failed to fetch|failed to store|request failed|networkerror|network error|load failed|err_|protocol|aborted|abort|timed? ?out|unexpected end|cache\.add|response was not ok/i.test(m)) return true;
+    if(this._webllmIsNetErr(err)) return true;
     if(/webgpu|gpu adapter|find adapter|compatible gpu|device lost|out of memory|maxbuffersize|maxstoragebuffer|shader-f16|f16|cannot find model|model record|not found in model_list|unsupported|quota|is not a function|is not defined/i.test(m)) return false;
     return n < 2;   /* something unrecognised: one more try, no more */
   },
   _webllmExplain: function(err, attempts){
-    var m = String(err && err.message || err || ''), model = this.model('webllm');
-    if(/cannot fetch|failed to fetch|failed to store|request failed|networkerror|network error|load failed|err_|protocol|aborted|abort|timed? ?out|unexpected end|cache\.add|response was not ok/i.test(m))
-      return 'The model download from Hugging Face kept failing (stopped after '+attempts+' attempt'+(attempts!==1?'s':'')+'). '+
-        'A proxy or content filter on this network \u2014 school and workplace networks especially \u2014 often breaks these large downloads. '+
-        'Try a different connection, or switch to Ollama in Settings \u2192 AI Engine. What was fetched is kept, so a later attempt picks up where this one stopped.';
+    var m = String(err && err.message || err || ''), model = this.model('webllm'), self = this;
+    if(err && err.fatal) return m;
+    if(this._webllmIsNetErr(err)){
+      var tried = (this._webllmTried||[]).map(function(s){ return self.webllmSourceName(s); }).join(', ') || 'Hugging Face';
+      if(!this._webllmBestShards){
+        return 'The model files could not be downloaded \u2014 tried '+tried+', and every attempt failed before a single piece arrived. '+
+          'That is this network blocking the download (usually a security proxy or content filter), not the servers being down. '+
+          'Open this page once on another connection (home Wi-Fi or a phone hotspot) and the model stays cached in this browser afterwards; '+
+          'or point WebLLM at your own model server in Settings \u2192 AI Engine; or switch to Ollama.';
+      }
+      return 'The download kept dropping out ('+this._webllmBestShards+(this._webllmShardTotal?' of '+this._webllmShardTotal:'')+' pieces saved, via '+tried+'). '+
+        'What was fetched is kept, so trying again later or on a steadier connection picks up where this stopped. Or switch to Ollama in Settings \u2192 AI Engine.';
+    }
     if(/device lost|out of memory|maxbuffersize|maxstoragebuffer/i.test(m))
       return 'This computer\u2019s graphics memory is too small for '+model+'. Pick a smaller model (Qwen2.5-3B, Phi-3.5-mini or SmolLM2-1.7B) in Settings \u2192 AI Engine, or switch to Ollama.';
     if(/shader-f16|f16/i.test(m))
@@ -3130,38 +3196,80 @@ var AI = {
     }
     this._webllmInitModel = want;
     this._webllmWatchers = onProgress ? [onProgress] : [];
-    this.webllmState = {phase:'loading', text:'Starting WebLLM\u2026', progress:0, attempt:1, error:'', raw:''};
+    this._webllmSrc = ''; this._webllmTried = []; this._webllmAttemptShards = 0; this._webllmShardTotal = 0; this._webllmBestShards = 0;
+    this.webllmState = {phase:'loading', text:'Starting WebLLM\u2026', progress:0, attempt:1, error:'', raw:'', source:''};
     this._webllmNotify('Starting WebLLM\u2026', 0, 'loading');
     var engine = null, attempts = this.WEBLLM_ATTEMPTS;
     var p = this._loadWebLLMLib().then(function(lib){
       if(self._webllm && self._webllmModel !== want){ try{ self._webllm.unload(); }catch(e){} self._webllm = null; self._webllmModel = null; }
-      var cfg = {initProgressCallback:function(r){
-        var raw = String(r && r.text || ''), pr = (r && typeof r.progress === 'number') ? r.progress : self.webllmState.progress;
-        self._webllmNotify(self._webllmPretty(raw, pr), pr, 'loading', raw);
-      }};
-      if(typeof lib.MLCEngine !== 'function'){
-        /* Older builds only expose the factory; no resume there, but it works. */
-        return lib.CreateMLCEngine(want, cfg);
-      }
-      engine = new lib.MLCEngine(cfg);
-      function attempt(n){
-        self.webllmState.attempt = n;
-        if(n > 1) self._webllmNotify('Download interrupted \u2014 resuming (attempt '+n+' of '+attempts+')\u2026', self.webllmState.progress, 'loading');
-        return engine.reload(want).then(function(){
-          /* An aborted reload resolves without a model; treat it as a failure. */
-          var ok = engine.loadedModelIdToPipeline ? engine.loadedModelIdToPipeline.size > 0 : true;
-          if(!ok) throw new Error('Cannot fetch model: the download was aborted');
-          return engine;
-        }).catch(function(err){
-          try{ engine.unload(); }catch(e){}
-          if(n >= attempts || !self._webllmRetryable(err, n)) throw err;
-          var wait = Math.min(20000, 1500 * Math.pow(2, n-1));
-          return new Promise(function(res){ setTimeout(res, wait); }).then(function(){ return attempt(n+1); });
-        });
-      }
-      return attempt(1);
+      var order = self.webllmSourceOrder(), cfgs = {};
+      order.forEach(function(src){ cfgs[src] = self._webllmAppConfig(lib, src); });
+      /* A route whose cache already holds the whole model needs no network at all. */
+      var probe = (typeof lib.hasModelInCache === 'function')
+        ? Promise.all(order.map(function(src){
+            if(!cfgs[src]) return false;
+            return Promise.resolve().then(function(){ return lib.hasModelInCache(want, cfgs[src]); }).catch(function(){ return false; }); }))
+        : Promise.resolve([]);
+      return probe.then(function(flags){
+        var hit = flags.indexOf(true);
+        if(hit > 0){ order.unshift(order.splice(hit, 1)[0]); }
+        var progressCb = function(r){
+          var raw = String(r && r.text || ''), pr = (r && typeof r.progress === 'number') ? r.progress : self.webllmState.progress;
+          var mm = /Fetching param cache\[(\d+)\/(\d+)\]/i.exec(raw);
+          if(mm){ self._webllmAttemptShards = Math.max(self._webllmAttemptShards, parseInt(mm[1],10)); self._webllmShardTotal = parseInt(mm[2],10) || self._webllmShardTotal; }
+          self._webllmNotify(self._webllmPretty(raw, pr), pr, 'loading', raw);
+        };
+        if(typeof lib.MLCEngine !== 'function'){
+          /* Older builds only expose the factory; no resume there, but it works. */
+          self._webllmSrc = order[0]; self._webllmTried = [order[0]];
+          return lib.CreateMLCEngine(want, {initProgressCallback:progressCb, appConfig: cfgs[order[0]] || undefined});
+        }
+        engine = new lib.MLCEngine({initProgressCallback:progressCb, appConfig: cfgs[order[0]] || undefined});
+        function useSource(si){
+          var src = order[si], cfg = cfgs[src];
+          self._webllmSrc = src; self._webllmTried.push(src);
+          if(!cfg){
+            var e0 = new Error('No server URL is set for WebLLM models. Add one in Settings \u2192 AI Engine, or choose another download source.');
+            e0.fatal = true; throw e0;
+          }
+          if(typeof engine.setAppConfig === 'function') engine.setAppConfig(cfg); else engine.appConfig = cfg;
+          var stalled = 0, prevMax = 0;
+          function attempt(n){
+            self.webllmState.attempt = n; self._webllmAttemptShards = 0;
+            if(n > 1) self._webllmNotify('Download interrupted \u2014 resuming (attempt '+n+' of '+attempts+' via '+self.webllmSourceName(src)+')\u2026', self.webllmState.progress, 'loading');
+            return engine.reload(want).then(function(){
+              /* An aborted reload resolves without a model; treat it as a failure. */
+              var ok = engine.loadedModelIdToPipeline ? engine.loadedModelIdToPipeline.size > 0 : true;
+              if(!ok) throw new Error('Cannot fetch model: the download was aborted');
+              return engine;
+            }).catch(function(err){
+              try{ engine.unload(); }catch(e){}
+              var landed = self._webllmAttemptShards;
+              self._webllmBestShards = Math.max(self._webllmBestShards, landed);
+              if(!self._webllmRetryable(err, n)) throw err;
+              /* Shards already saved are counted again on every attempt (they
+                 come straight from the cache), so "no new shard" means the
+                 count did not move past the previous attempt's. Twice running
+                 and this route is blocked here, not merely flaky. */
+              if(landed <= prevMax) stalled++; else stalled = 0;
+              prevMax = Math.max(prevMax, landed);
+              var next = (si + 1 < order.length) ? order[si+1] : null;
+              if(stalled >= 2 && next){
+                self._webllmNotify(self.webllmSourceName(src)+' is blocked on this network \u2014 trying '+self.webllmSourceName(next)+'\u2026', self.webllmState.progress, 'loading');
+                return useSource(si+1);
+              }
+              if(n >= attempts){ if(next) return useSource(si+1); throw err; }
+              var wait = Math.min(20000, 1500 * Math.pow(2, n-1));
+              return new Promise(function(res){ setTimeout(res, wait); }).then(function(){ return attempt(n+1); });
+            });
+          }
+          return attempt(1);
+        }
+        return useSource(0);
+      });
     }).then(function(eng){
       self._webllm = eng; self._webllmModel = want; self._webllmLastErr = null; self._webllmFailures = 0;
+      if(self._webllmSrc && self.cfg.webllmLastGood !== self._webllmSrc){ self.cfg.webllmLastGood = self._webllmSrc; self.save(); }
       self._webllmNotify(self._webllmShort(want)+' is ready', 1, 'ready');
       return eng;
     }).catch(function(err){
@@ -3184,6 +3292,13 @@ var AI = {
       toast('success', self._webllmShort(self.model('webllm'))+' is loaded \u2014 research and fact-checks now run in this tab');
       return e;
     }).catch(function(e){ toast('error', e.message || 'WebLLM could not start'); throw e; });
+  },
+  /* Settings changed the route: forget the last failure so the next call tries again at once. */
+  setWebLLMSource: function(src, url){
+    if(src != null) this.cfg.webllmSource = src;
+    if(url != null) this.cfg.webllmMirror = String(url).trim();
+    this._webllmLastErr = null; this._webllmFailures = 0;
+    this.save();
   },
 
   /* ------------------------------- chat core ------------------------------ */
@@ -3334,13 +3449,16 @@ AI.onWebLLMStatus = function(st){
     _webllmToldStart = AI.model('webllm');
     toast('info', 'WebLLM is downloading '+AI._webllmShort(AI.model('webllm'))+' \u2014 a one-time download kept in this browser. Research and checks run once it is in.');
   }
+  if(st && st.phase === 'loading' && /is blocked on this network/.test(st.text||'')){
+    toast('info', st.text);
+  }
   clearTimeout(_webllmUiTimer);
   var wait = 400 - (Date.now() - _webllmUiAt);
   if(wait <= 0) run(); else _webllmUiTimer = setTimeout(run, wait);
 };
 /* The WebLLM panel in both settings screens: ready / downloading / failed /
-   not yet fetched. attr is "data-act" or "data-wp"; act is the button action. */
-function webllmStatusHTML(attr, act){
+   not yet fetched. attrName is "data-act" or "data-wp"; act is the button action. */
+function webllmStatusHTML(attrName, act){
   var st = AI.webllmState || {}, m = AI.model('webllm');
   var h = '<div style="margin-bottom:12px">';
   if(AI.webllmReady()){
@@ -3353,11 +3471,22 @@ function webllmStatusHTML(attr, act){
       (st.attempt > 1 ? '<p class="t-mute2" style="font-size:11.5px;margin-top:6px">Attempt '+st.attempt+' of '+AI.WEBLLM_ATTEMPTS+' \u2014 resuming from what is already saved.</p>' : '');
   } else {
     if(st.phase === 'error' && st.error) h += '<div class="note red" style="margin-bottom:10px">'+ic('alert',15)+'<span>'+esc(st.error)+'</span></div>';
-    h += '<button class="btn btn-secondary btn-sm" '+attr+'="'+act+'">'+ic('download',14)+
+    h += '<button class="btn btn-secondary btn-sm" '+attrName+'="'+act+'">'+ic('download',14)+
       (st.phase === 'error' ? 'Try the download again' : 'Download and load '+esc(AI._webllmShort(m))+' now')+'</button>'+
-      '<p class="t-mute2" style="font-size:11.5px;margin-top:7px">A one-time download of roughly 1\u20133 GB from Hugging Face, kept in this browser. '+
+      '<p class="t-mute2" style="font-size:11.5px;margin-top:7px">A one-time download of roughly 1\u20133 GB, kept in this browser. '+
       'Doing it here means the first research or fact-check does not have to wait for it.</p>';
   }
+  var src = AI.cfg.webllmSource || 'auto';
+  h += '<div style="margin-top:12px"><label class="lbl">Download models from</label>'+
+    '<select class="inp" data-onchange="webllmSource">'+
+    [['auto','Automatic \u2014 Hugging Face, then your server, then hf-mirror.com'],
+     ['hf','Hugging Face only'],
+     ['custom','Your own server only'],
+     ['mirror','hf-mirror.com only (community mirror)']].map(function(o){
+      return '<option value="'+o[0]+'"'+(src===o[0]?' selected':'')+'>'+esc(o[1])+'</option>'; }).join('')+'</select>'+
+    '<input class="inp" style="margin-top:8px" data-oninput="webllmMirror" placeholder="https://models.example.com/" value="'+attr(AI.cfg.webllmMirror||'')+'">'+
+    '<p class="t-mute2" style="font-size:11.5px;margin-top:6px">Some networks block Hugging Face\u2019s download servers. '+
+    'A server of your own must serve the model folders exactly as Hugging Face does \u2014 <code style="font-family:var(--font-mono)">&lt;url&gt;/&lt;model id&gt;/resolve/main/\u2026</code> \u2014 with CORS open to this site.</p></div>';
   return h + '</div>';
 }
 
@@ -18222,6 +18351,7 @@ document.addEventListener('input', function(ev){
     case 'tpName': S.page.tp.name = t.value; break;
     case 'detPage': S.page.detPage = t.value; render(); break;
     case 'ollamaUrl': AI.cfg.ollamaUrl = t.value; AI.save(); break;
+    case 'webllmMirror': AI.setWebLLMSource(null, t.value); break;
     case 'aiTemp': AI.cfg.temperature = parseFloat(t.value); AI.save();
       var lb = t.previousElementSibling; if(lb) lb.textContent = 'Creativity (temperature) — '+t.value; break;
     case 'docName': WP.cur.name = t.value; wpTouch(); break;
@@ -18298,6 +18428,8 @@ document.addEventListener('change', function(ev){
     case 'defExport': S.prefs.default_export_format = t.value; savePrefs(); break;
     case 'fontSize': S.prefs.font_size = t.value; savePrefs(); applyA11y(); render(); break;
     case 'aiModel': AI.setModel(AI.provider(), t.value); toast('success','Model set to '+t.value); break;
+    case 'webllmSource': AI.setWebLLMSource(t.value, null);
+      toast('info', t.value==='auto' ? 'WebLLM will try Hugging Face first and fall back to the other routes' : 'WebLLM models will come from '+AI.webllmSourceName(t.value)+' only'); break;
   }
 });
 
