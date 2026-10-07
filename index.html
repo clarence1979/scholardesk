@@ -3037,19 +3037,153 @@ var AI = {
   /* ------------------------------- WebLLM --------------------------------- */
   _loadWebLLMLib: function(){
     if(this._webllmLibP) return this._webllmLibP;
+    var self = this;
     this._webllmLibP = import('https://esm.run/@mlc-ai/web-llm').catch(function(){
       return import('https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm/+esm');
+    }).catch(function(){
+      /* A failed import used to stick for the life of the page, so one blip
+         while loading the library meant WebLLM was dead until a reload. */
+      self._webllmLibP = null;
+      throw new Error('Could not load the WebLLM library. Check the connection and try again.');
     });
     return this._webllmLibP;
   },
   webllmReady: function(){ return !!this._webllm && this._webllmModel === this.model('webllm'); },
-  initWebLLM: function(onProgress){
+
+  /* One download, shared by everyone who asks for the engine.
+
+     Research, fact-checking and Autopilot can all want the model within the
+     same second. Before this each of them called CreateMLCEngine on its own,
+     so the same 2 GB model was being pulled three or four times at once, each
+     copy with its own four parallel shard fetches, all down one HTTP/2
+     connection to Hugging Face, which the CDN cut off with
+     ERR_HTTP2_PROTOCOL_ERROR, and every caller then reported "Research
+     failed". Now the first caller starts the download, later callers join it,
+     and a download that trips over the network resumes rather than giving up:
+     shards already fetched are kept in the browser cache, so each attempt
+     picks up where the last one stopped. */
+  WEBLLM_ATTEMPTS: 5,
+  WEBLLM_COOLDOWN_MS: 45000,
+  webllmState: {phase:'idle', text:'', progress:0, attempt:0, error:'', raw:''},
+  _webllmInitP: null, _webllmInitModel: null, _webllmWatchers: [],
+  _webllmFailedAt: 0, _webllmLastErr: null, _webllmFailures: 0,
+
+  _webllmShort: function(m){ return String(m||'').replace(/-MLC$/,'').replace(/-q\df\d\d_\d.*$/,''); },
+  /* WebLLM's own progress strings are a paragraph long; one line is enough. */
+  _webllmPretty: function(raw, progress){
+    var pct = Math.round((progress||0)*100), m = this._webllmShort(this._webllmInitModel || this.model('webllm'));
+    if(/fetching param/i.test(raw)) return 'Downloading '+m+' \u2014 '+pct+'% (first use only; it stays in this browser)';
+    if(/loading model from cache|loading gpu shader|loading from cache/i.test(raw)) return 'Loading '+m+' into the GPU \u2014 '+pct+'%';
+    if(/finish loading/i.test(raw)) return m+' is ready';
+    return raw ? String(raw).slice(0,140) : ('Preparing '+m+'\u2026');
+  },
+  _webllmNotify: function(text, progress, phase, raw){
+    var st = this.webllmState;
+    st.text = text; st.progress = progress; st.raw = raw || st.raw; if(phase) st.phase = phase;
+    this._webllmWatchers.forEach(function(fn){ try{ fn(text, progress, st); }catch(e){} });
+    if(typeof this.onWebLLMStatus === 'function'){ try{ this.onWebLLMStatus(st); }catch(e){} }
+  },
+  /* Network trouble is worth another go; a missing GPU or a model that does
+     not fit is not. Checked in this order because the WASM file name itself
+     contains "webgpu", so a failed fetch of it would otherwise read as fatal. */
+  _webllmRetryable: function(err, n){
+    var m = String(err && err.message || err || '');
+    if(/cannot fetch|failed to fetch|failed to store|request failed|networkerror|network error|load failed|err_|protocol|aborted|abort|timed? ?out|unexpected end|cache\.add|response was not ok/i.test(m)) return true;
+    if(/webgpu|gpu adapter|find adapter|compatible gpu|device lost|out of memory|maxbuffersize|maxstoragebuffer|shader-f16|f16|cannot find model|model record|not found in model_list|unsupported|quota|is not a function|is not defined/i.test(m)) return false;
+    return n < 2;   /* something unrecognised: one more try, no more */
+  },
+  _webllmExplain: function(err, attempts){
+    var m = String(err && err.message || err || ''), model = this.model('webllm');
+    if(/cannot fetch|failed to fetch|failed to store|request failed|networkerror|network error|load failed|err_|protocol|aborted|abort|timed? ?out|unexpected end|cache\.add|response was not ok/i.test(m))
+      return 'The model download from Hugging Face kept failing (stopped after '+attempts+' attempt'+(attempts!==1?'s':'')+'). '+
+        'A proxy or content filter on this network \u2014 school and workplace networks especially \u2014 often breaks these large downloads. '+
+        'Try a different connection, or switch to Ollama in Settings \u2192 AI Engine. What was fetched is kept, so a later attempt picks up where this one stopped.';
+    if(/device lost|out of memory|maxbuffersize|maxstoragebuffer/i.test(m))
+      return 'This computer\u2019s graphics memory is too small for '+model+'. Pick a smaller model (Qwen2.5-3B, Phi-3.5-mini or SmolLM2-1.7B) in Settings \u2192 AI Engine, or switch to Ollama.';
+    if(/shader-f16|f16/i.test(m))
+      return 'This GPU cannot run a q4f16 model. Pick a q4f32 model in Settings \u2192 AI Engine, or switch to Ollama.';
+    if(/quota/i.test(m))
+      return 'The browser refused to store the model (storage quota). Free some disk space or clear site data elsewhere, then try again.';
+    if(/cannot find model|model record|not found in model_list/i.test(m))
+      return 'WebLLM does not know the model \u201C'+model+'\u201D. Press Fetch latest in Settings \u2192 AI Engine and pick one from the list.';
+    if(/webgpu|gpu adapter|find adapter|compatible gpu/i.test(m))
+      return 'WebGPU could not start on this computer. Use Chrome or Edge 113+ with graphics acceleration on, or switch to Ollama.';
+    return 'WebLLM could not start: '+m.slice(0,180);
+  },
+  initWebLLM: function(onProgress, opts){
+    opts = opts || {};
     var self = this, want = this.model('webllm');
     if(this.webllmReady()) return Promise.resolve(this._webllm);
     if(!navigator.gpu) return Promise.reject(new Error('WebGPU is not available in this browser. Try Chrome or Edge 113+, or switch to Ollama.'));
-    return this._loadWebLLMLib().then(function(lib){
-      return lib.CreateMLCEngine(want, {initProgressCallback:function(p){ if(onProgress) onProgress(p.text||'', p.progress||0); }});
-    }).then(function(engine){ self._webllm = engine; self._webllmModel = want; return engine; });
+    /* Already downloading this model: join that download. */
+    if(this._webllmInitP && this._webllmInitModel === want){
+      if(onProgress){ this._webllmWatchers.push(onProgress);
+        try{ onProgress(this.webllmState.text, this.webllmState.progress, this.webllmState); }catch(e){} }
+      return this._webllmInitP;
+    }
+    /* A download that has just failed must not be restarted by every pause
+       in typing. Automatic callers wait out the cool-down; an explicit Test
+       connection or Download button passes force and goes straight ahead. */
+    var cool = Math.min(600000, this.WEBLLM_COOLDOWN_MS * Math.pow(2, Math.max(0, this._webllmFailures - 1)));
+    if(!opts.force && this._webllmLastErr && (Date.now() - this._webllmFailedAt) < cool){
+      return Promise.reject(this._webllmLastErr);
+    }
+    this._webllmInitModel = want;
+    this._webllmWatchers = onProgress ? [onProgress] : [];
+    this.webllmState = {phase:'loading', text:'Starting WebLLM\u2026', progress:0, attempt:1, error:'', raw:''};
+    this._webllmNotify('Starting WebLLM\u2026', 0, 'loading');
+    var engine = null, attempts = this.WEBLLM_ATTEMPTS;
+    var p = this._loadWebLLMLib().then(function(lib){
+      if(self._webllm && self._webllmModel !== want){ try{ self._webllm.unload(); }catch(e){} self._webllm = null; self._webllmModel = null; }
+      var cfg = {initProgressCallback:function(r){
+        var raw = String(r && r.text || ''), pr = (r && typeof r.progress === 'number') ? r.progress : self.webllmState.progress;
+        self._webllmNotify(self._webllmPretty(raw, pr), pr, 'loading', raw);
+      }};
+      if(typeof lib.MLCEngine !== 'function'){
+        /* Older builds only expose the factory; no resume there, but it works. */
+        return lib.CreateMLCEngine(want, cfg);
+      }
+      engine = new lib.MLCEngine(cfg);
+      function attempt(n){
+        self.webllmState.attempt = n;
+        if(n > 1) self._webllmNotify('Download interrupted \u2014 resuming (attempt '+n+' of '+attempts+')\u2026', self.webllmState.progress, 'loading');
+        return engine.reload(want).then(function(){
+          /* An aborted reload resolves without a model; treat it as a failure. */
+          var ok = engine.loadedModelIdToPipeline ? engine.loadedModelIdToPipeline.size > 0 : true;
+          if(!ok) throw new Error('Cannot fetch model: the download was aborted');
+          return engine;
+        }).catch(function(err){
+          try{ engine.unload(); }catch(e){}
+          if(n >= attempts || !self._webllmRetryable(err, n)) throw err;
+          var wait = Math.min(20000, 1500 * Math.pow(2, n-1));
+          return new Promise(function(res){ setTimeout(res, wait); }).then(function(){ return attempt(n+1); });
+        });
+      }
+      return attempt(1);
+    }).then(function(eng){
+      self._webllm = eng; self._webllmModel = want; self._webllmLastErr = null; self._webllmFailures = 0;
+      self._webllmNotify(self._webllmShort(want)+' is ready', 1, 'ready');
+      return eng;
+    }).catch(function(err){
+      var friendly = new Error(self._webllmExplain(err, self.webllmState.attempt || 1));
+      friendly.cause = err;
+      try{ console.warn('[WebLLM]', err); }catch(e){}
+      self._webllmLastErr = friendly; self._webllmFailedAt = Date.now(); self._webllmFailures++;
+      self.webllmState.error = friendly.message;
+      self._webllmNotify(friendly.message, self.webllmState.progress, 'error');
+      throw friendly;
+    }).then(function(x){ self._webllmInitP = null; self._webllmWatchers = []; return x; },
+            function(e){ self._webllmInitP = null; self._webllmWatchers = []; throw e; });
+    this._webllmInitP = p;
+    return p;
+  },
+  /* Explicit download from Settings: no cool-down, and a toast at the end. */
+  preloadWebLLM: function(){
+    var self = this;
+    return this.initWebLLM(null, {force:true}).then(function(e){
+      toast('success', self._webllmShort(self.model('webllm'))+' is loaded \u2014 research and fact-checks now run in this tab');
+      return e;
+    }).catch(function(e){ toast('error', e.message || 'WebLLM could not start'); throw e; });
   },
 
   /* ------------------------------- chat core ------------------------------ */
@@ -3077,11 +3211,20 @@ var AI = {
       });
     }
     if(p==='webllm'){
-      return this.initWebLLM(opts.onProgress).then(function(engine){
-        return engine.chat.completions.create({
-          messages: (sys?[{role:'system',content:sys}]:[]).concat(msgs),
-          temperature: temp, max_tokens: maxTok });
-      }).then(function(r){ return (r.choices&&r.choices[0]&&r.choices[0].message.content)||''; });
+      return this.initWebLLM(opts.onProgress, opts).then(function(engine){
+        var req = {messages: (sys?[{role:'system',content:sys}]:[]).concat(msgs),
+          temperature: temp, max_tokens: maxTok};
+        /* Grammar-guided JSON: a 3B model asked for JSON in prose returns
+           prose often enough that research "failed" on perfectly good runs. */
+        if(opts.json) req.response_format = {type:'json_object'};
+        return engine.chat.completions.create(req).catch(function(e){
+          if(req.response_format && /grammar|response_format|json|schema|xgrammar/i.test(String(e && e.message || e))){
+            delete req.response_format;
+            return engine.chat.completions.create(req);
+          }
+          throw e;
+        });
+      }).then(function(r){ return (r.choices&&r.choices[0]&&r.choices[0].message&&r.choices[0].message.content)||''; });
     }
     if(p==='openai'){
       if(!this.hasKey('openai')) return Promise.reject(new Error('Add an OpenAI API key in Settings → AI Engine.'));
@@ -3153,8 +3296,9 @@ var AI = {
 
   /* Ask for JSON and parse it defensively — small local models add prose. */
   json: function(system, user, opts){
+    var o = {}; for(var k in (opts||{})) o[k] = opts[k]; o.json = true;
     return this.chat([{role:'system',content:system+'\n\nRespond with valid JSON only. No markdown fences, no commentary.'},
-      {role:'user',content:user}], opts).then(function(txt){
+      {role:'user',content:user}], o).then(function(txt){
       var t = String(txt).trim().replace(/^```(?:json)?/i,'').replace(/```$/,'').trim();
       try{ return JSON.parse(t); }catch(e){}
       var s = t.indexOf('{'), a = t.indexOf('[');
@@ -3173,6 +3317,49 @@ var AI = {
     });
   }
 };
+
+/* Whoever is looking at an AI Engine settings panel sees the download move.
+   Throttled: WebLLM reports every shard, and the GPU-load phase reports in
+   bursts. */
+var _webllmUiTimer = null, _webllmUiAt = 0, _webllmToldStart = '';
+AI.onWebLLMStatus = function(st){
+  var run = function(){
+    _webllmUiAt = Date.now();
+    try{
+      if(typeof S !== 'undefined' && S.route === 'settings' && S.page && S.page.set && S.page.set.tab === 'ai' && AI.provider()==='webllm') render();
+      if(document.getElementById('aiset-body')) wpAISettingsRefresh();
+    }catch(e){}
+  };
+  if(st && st.phase === 'loading' && /^Downloading/.test(st.text||'') && _webllmToldStart !== AI.model('webllm')){
+    _webllmToldStart = AI.model('webllm');
+    toast('info', 'WebLLM is downloading '+AI._webllmShort(AI.model('webllm'))+' \u2014 a one-time download kept in this browser. Research and checks run once it is in.');
+  }
+  clearTimeout(_webllmUiTimer);
+  var wait = 400 - (Date.now() - _webllmUiAt);
+  if(wait <= 0) run(); else _webllmUiTimer = setTimeout(run, wait);
+};
+/* The WebLLM panel in both settings screens: ready / downloading / failed /
+   not yet fetched. attr is "data-act" or "data-wp"; act is the button action. */
+function webllmStatusHTML(attr, act){
+  var st = AI.webllmState || {}, m = AI.model('webllm');
+  var h = '<div style="margin-bottom:12px">';
+  if(AI.webllmReady()){
+    h += '<div class="note emerald">'+ic('check2',15)+'<span><strong>'+esc(m)+'</strong> is loaded and ready in this tab.</span></div>';
+  } else if(st.phase === 'loading'){
+    var pct = Math.round((st.progress||0)*100);
+    h += '<div class="row" style="justify-content:space-between;font-size:11.5px;margin-bottom:4px">'+
+      '<span class="t-mute">'+esc(st.text||'Loading model\u2026')+'</span><span>'+pct+'%</span></div>'+
+      '<div class="bar"><i class="brand" style="width:'+pct+'%"></i></div>'+
+      (st.attempt > 1 ? '<p class="t-mute2" style="font-size:11.5px;margin-top:6px">Attempt '+st.attempt+' of '+AI.WEBLLM_ATTEMPTS+' \u2014 resuming from what is already saved.</p>' : '');
+  } else {
+    if(st.phase === 'error' && st.error) h += '<div class="note red" style="margin-bottom:10px">'+ic('alert',15)+'<span>'+esc(st.error)+'</span></div>';
+    h += '<button class="btn btn-secondary btn-sm" '+attr+'="'+act+'">'+ic('download',14)+
+      (st.phase === 'error' ? 'Try the download again' : 'Download and load '+esc(AI._webllmShort(m))+' now')+'</button>'+
+      '<p class="t-mute2" style="font-size:11.5px;margin-top:7px">A one-time download of roughly 1\u20133 GB from Hugging Face, kept in this browser. '+
+      'Doing it here means the first research or fact-check does not have to wait for it.</p>';
+  }
+  return h + '</div>';
+}
 
 /* =================== citation-specific AI operations ====================== */
 var META_SCHEMA = '{ "type": "journal"|"book"|"website"|"thesis"|"report"|"conference"|"video"|"podcast"|"legislation"|"dataset"|"other", "title": string|null, "authors": [{"last": string, "first": string, "initials": string}], "year": number|null, "journal": string|null, "volume": string|null, "issue": string|null, "pages": string|null, "doi": string|null, "url": string|null, "publisher": string|null, "place_of_publication": string|null, "edition": string|null, "website_name": string|null, "retrieval_date": string|null, "abstract": string|null, "confidence": "high"|"medium"|"low" }';
@@ -4825,9 +5012,7 @@ ROUTES.settings = function(){
       h += '<div class="note '+(navigator.gpu?'emerald':'amber')+'" style="margin-bottom:12px">'+ic(navigator.gpu?'check2':'alert',15)+
         '<span>'+(navigator.gpu?'WebGPU is available — models run directly in this tab.'
           :'WebGPU was not detected. Use Chrome or Edge 113+, or switch to Ollama.')+'</span></div>'+
-        (S.page.webllmProgress!=null?'<div style="margin-bottom:12px"><div class="row" style="justify-content:space-between;font-size:11.5px;margin-bottom:4px">'+
-          '<span class="t-mute">'+esc(S.page.webllmMsg||'Loading model…')+'</span><span>'+Math.round((S.page.webllmProgress||0)*100)+'%</span></div>'+
-          '<div class="bar"><i class="brand" style="width:'+Math.round((S.page.webllmProgress||0)*100)+'%"></i></div></div>':'');
+        webllmStatusHTML('data-act', 'ai-webllm-load');
     }
     if(pr.needsKey){
       var has = AI.hasKey(cur), days = AI.keyDaysLeft(cur);
@@ -9108,7 +9293,7 @@ function evTrailingFragment(){
     heading: evDocHeading()};
 }
 
-function evAIResearch(frag){
+function evAIResearch(frag, onProgress){
   var web = evWebCapable();
   var sys = 'A writer has stopped mid-sentence. Finish the factual statement they were making, ' +
     'accurately.\n' + (web ? 'Search the web before answering.\n' : '') +
@@ -9129,12 +9314,12 @@ function evAIResearch(frag){
   var user = (frag.heading ? 'Document title: ' + frag.heading + '\n\n' : '') +
     'Passage (the unfinished sentence is at the end):\n' + frag.context +
     '\n\nFinish this sentence: ' + frag.text;
-  return AI.json(sys, user, {temperature:0.1, maxTokens:900, web:web})
+  return AI.json(sys, user, {temperature:0.1, maxTokens:900, web:web, onProgress:onProgress})
     .catch(function(e){
       /* Some models reject the web-search tool outright. Losing the answer
          over that is worse than answering without a search. */
       if(!web) throw e;
-      return AI.json(sys, user, {temperature:0.1, maxTokens:900, web:false});
+      return AI.json(sys, user, {temperature:0.1, maxTokens:900, web:false, onProgress:onProgress});
     });
 }
 
@@ -9181,7 +9366,19 @@ function evAutoResearch(){
     if(msg && EV._resErr !== msg){ EV._resErr = msg; toast('error', msg); }
   }
 
-  evAIResearch(frag).then(function(r){
+  /* Only WebLLM reports progress here, and only while it is fetching or
+     loading its model. Without this the card said "Researching\u2026" for the
+     whole of a multi-gigabyte download, which reads as a hang. */
+  var noteTimer = null;
+  function onProgress(text){
+    var R = EV.research;
+    if(!R || R.frag !== frag || R.state !== 'working') return;
+    R.note = text || '';
+    if(noteTimer) return;
+    noteTimer = setTimeout(function(){ noteTimer = null;
+      if(EV.research && EV.research.frag === frag && EV.research.state === 'working') evShowResearch(); }, 350);
+  }
+  evAIResearch(frag, onProgress).then(function(r){
     if(!r || !r.completion){ giveUp('Research came back empty \u2014 try rewording the sentence.'); return; }
     EV.research = {frag:frag, state:'partial',
       completion:String(r.completion).trim(), subject:r.subject || '',
@@ -9219,7 +9416,7 @@ function evAutoResearch(){
         evShowResearch();
       });
   }).catch(function(err){
-    giveUp('Research failed: ' + String(err && err.message || err).slice(0,120));
+    giveUp('Research failed: ' + String(err && err.message || err).slice(0,260));
   });
 }
 
@@ -9229,8 +9426,8 @@ function evResearchCardHTML(){
   if(R.state === 'working'){
     return '<div class="ev-card">' +
       '<span class="ais-ico">' + ic('loader',15,'spin t-mute') + '</span>' +
-      '<span class="ais-txt"><strong>Researching that sentence\u2026</strong>' +
-      '<span class="ev-sug-src">' + esc('\u201C' + R.frag.text.slice(0,70) + '\u201D') + '</span></span>' +
+      '<span class="ais-txt"><strong>' + (R.note ? 'Getting the local model ready\u2026' : 'Researching that sentence\u2026') + '</strong>' +
+      '<span class="ev-sug-src">' + esc(R.note || ('\u201C' + R.frag.text.slice(0,70) + '\u201D')) + '</span></span>' +
       '<button class="btn btn-ghost btn-xs" data-wp="ev-res-no">Cancel</button></div>';
   }
   if(R.state === 'partial'){
@@ -11344,8 +11541,9 @@ function wpCmd(cmd, arg){
       return; }
     case 'aiset-proactive': AI.cfg.proactive=!(AI.cfg.proactive!==false); AI.save();
       toast('info', AI.cfg.proactive?'Autopilot will suggest drafts as you type':'Draft suggestions off'); wpAISettingsRefresh(); return;
+    case 'aiset-webllm-load': AI.preloadWebLLM().catch(function(){}); wpAISettingsRefresh(); return;
     case 'aiset-test': { WP._aiset.testing=true; WP._aiset.test=null; wpAISettingsRefresh();
-      AI.chat([{role:'user',content:'Reply with exactly: ScholarDesk connection OK'}], {maxTokens:40,
+      AI.chat([{role:'user',content:'Reply with exactly: ScholarDesk connection OK'}], {maxTokens:40, force:true,
         onProgress:function(t){ WP._aiset.test=t; WP._aiset.testOk=true; wpAISettingsRefresh(); }})
         .then(function(out){ WP._aiset.testing=false; WP._aiset.testOk=true;
           WP._aiset.test='Connected \u2014 '+PROVIDERS[AI.provider()].name+' ('+AI.model()+') replied: \u201C'+String(out).trim().slice(0,100)+'\u201D'; wpAISettingsRefresh(); })
@@ -11969,9 +12167,10 @@ function wpAISettingsBody(){
       '<code style="font-family:var(--font-mono)">ollama pull llama3.2</code>.</span></div>';
   }
   if(cur==='webllm'){
-    h += '<div class="note '+(navigator.gpu?'emerald':'amber')+'">'+ic(navigator.gpu?'check2':'alert',15)+
+    h += '<div class="note '+(navigator.gpu?'emerald':'amber')+'" style="margin-bottom:12px">'+ic(navigator.gpu?'check2':'alert',15)+
       '<span>'+(navigator.gpu?'WebGPU is available — models run directly in this browser tab.'
-        :'WebGPU was not detected. Use Chrome or Edge 113+, or switch to Ollama.')+'</span></div>';
+        :'WebGPU was not detected. Use Chrome or Edge 113+, or switch to Ollama.')+'</span></div>'+
+      webllmStatusHTML('data-wp', 'aiset-webllm-load');
   }
   if(pr.needsKey){
     var has = AI.hasKey(cur), days = AI.keyDaysLeft(cur);
@@ -17837,6 +18036,7 @@ document.addEventListener('click', function(ev){
     case 'ai-wipe-keys': confirmDialog('Delete all API keys?','You will need to paste them again to use cloud models.',
       function(){ AI.clearAllKeys(); render(); toast('success','All keys deleted'); },'Delete keys', true); break;
     case 'ai-fetch-models': fetchModels(el.getAttribute('data-p')); break;
+    case 'ai-webllm-load': AI.preloadWebLLM().catch(function(){}); render(); break;
     case 'ai-test': testAI(); break;
     case 'data-backup': download(JSON.stringify({kind:'citesmart-backup', at:nowISO(), refs:S.refs, cols:S.cols,
       teams:S.teams, prefs:S.prefs, docs:jget(K.docs,[])}, null, 2),
@@ -18468,7 +18668,7 @@ function sendChat(){
 }
 function testAI(){
   S.page.testing = true; S.page.testOut=''; render();
-  AI.chat([{role:'user', content:'Reply with exactly: CiteSmart connection OK'}], {maxTokens:40,
+  AI.chat([{role:'user', content:'Reply with exactly: CiteSmart connection OK'}], {maxTokens:40, force:true,
     onProgress:function(t,p){ S.page.testOut = t; S.page.testOk=true; render(); }})
     .then(function(out){
       S.page.testing=false; S.page.testOk=true;
